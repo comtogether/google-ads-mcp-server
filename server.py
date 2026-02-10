@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import OAuth modules after environment is loaded
-from oauth.google_auth import format_customer_id, get_headers_with_auto_token, execute_gaql
+from oauth.google_auth import format_customer_id, get_headers_with_auto_token, execute_gaql, API_VERSION
 
 # Get environment variables
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
@@ -114,7 +114,7 @@ def list_accounts(ctx: Context = None) -> Dict[str, Any]:
         headers = get_headers_with_auto_token()
         
         # Fetch top-level accessible customers
-        url = "https://googleads.googleapis.com/v19/customers:listAccessibleCustomers"
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
         resp = requests.get(url, headers=headers)
         if not resp.ok:
             if ctx:
@@ -229,7 +229,7 @@ def run_keyword_planner(
         headers = get_headers_with_auto_token()
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/v19/customers/{formatted_customer_id}:generateKeywordIdeas"
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}:generateKeywordIdeas"
         
         if manager_id:
             headers['login-customer-id'] = format_customer_id(manager_id)
