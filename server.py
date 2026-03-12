@@ -1,5 +1,6 @@
 from fastmcp import FastMCP, Context
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 import os
 import logging
 import requests
@@ -74,6 +75,100 @@ def get_sub_accounts(manager_id: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+# ---------------------------------------------------------------------------
+# Name-to-ID resolution (caches load once per server session)
+# ---------------------------------------------------------------------------
+
+_account_cache: Dict[str, str] | None = None  # lowercase name -> formatted customer ID
+_manager_map: Dict[str, str] | None = None    # customer_id -> parent manager ID
+
+
+def _load_account_cache() -> tuple[Dict[str, str], Dict[str, str]]:
+    """Populate account name and manager caches from list_accounts logic."""
+    global _account_cache, _manager_map
+    if _account_cache is not None and _manager_map is not None:
+        return _account_cache, _manager_map
+
+    _account_cache = {}
+    _manager_map = {}
+
+    headers = get_headers_with_auto_token()
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
+    resp = requests.get(url, headers=headers)
+    if not resp.ok:
+        return _account_cache, _manager_map
+
+    resource_names = resp.json().get('resourceNames', [])
+    seen = set()
+
+    for resource in resource_names:
+        cid = resource.split('/')[-1]
+        fid = format_customer_id(cid)
+        name = get_customer_name(fid)
+        manager = is_manager_account(fid)
+
+        if name and not name.startswith("Name not available"):
+            _account_cache[name.lower()] = fid
+        seen.add(fid)
+
+        if manager:
+            subs = get_sub_accounts(fid)
+            for sub in subs:
+                if sub['id'] not in seen:
+                    sub_name = sub.get('name', '')
+                    if sub_name and not sub_name.startswith("Sub-account"):
+                        _account_cache[sub_name.lower()] = sub['id']
+                    _manager_map[sub['id']] = fid
+                    seen.add(sub['id'])
+                    if sub['is_manager']:
+                        nested = get_sub_accounts(sub['id'])
+                        for n in nested:
+                            if n['id'] not in seen:
+                                n_name = n.get('name', '')
+                                if n_name and not n_name.startswith("Sub-account"):
+                                    _account_cache[n_name.lower()] = n['id']
+                                _manager_map[n['id']] = sub['id']
+                                seen.add(n['id'])
+
+    return _account_cache, _manager_map
+
+
+def _resolve_account(value: str) -> str:
+    """Resolve an account name or ID to a formatted customer ID.
+
+    - Numeric values (with or without dashes) are returned as-is after formatting.
+    - Non-numeric values are looked up by name: exact match first, then substring.
+    - If multiple substring matches resolve to different IDs, raises ValueError.
+    """
+    stripped = value.replace('-', '').replace(' ', '')
+    if stripped.isdigit():
+        return format_customer_id(stripped)
+
+    cache, _ = _load_account_cache()
+    key = value.lower().strip()
+
+    # Exact match
+    if key in cache:
+        return cache[key]
+
+    # Substring/partial match
+    matches = [(k, v) for k, v in cache.items() if key in k]
+    unique_ids = set(v for _, v in matches)
+    if len(unique_ids) == 1:
+        return unique_ids.pop()
+    if len(unique_ids) > 1:
+        raise ValueError(f"Ambiguous account '{value}' - matches: {[m[0] for m in matches]}")
+    raise ValueError(f"Account '{value}' not found. Use list_accounts to see available accounts.")
+
+
+def _auto_manager_id(customer_id: str, manager_id: str) -> str:
+    """Auto-fill manager_id from cache if the account is managed and no manager_id was provided."""
+    if manager_id:
+        return manager_id
+    _, mgr_map = _load_account_cache()
+    return mgr_map.get(customer_id, "")
+
+
 @mcp.tool
 def run_gaql(
     customer_id: str,
@@ -81,7 +176,13 @@ def run_gaql(
     manager_id: str = "",
     ctx: Context = None
 ) -> Dict[str, Any]:
-    """Execute GAQL using the non-streaming search endpoint for consistent JSON parsing."""
+    """Execute a Google Ads Query Language (GAQL) query against a customer account.
+
+    Args:
+        customer_id: Customer ID (10 digits) or account name. Names are resolved via cached account list.
+        query: GAQL query string. See gaql://reference resource for syntax and examples.
+        manager_id: MCC manager ID or name. Auto-filled for managed sub-accounts if omitted. Only needed to override the auto-detected manager.
+    """
     if ctx:
         ctx.info(f"Executing GAQL query for customer {customer_id}...")
         ctx.info(f"Query: {query}")
@@ -90,7 +191,10 @@ def run_gaql(
         raise ValueError("Google Ads Developer Token is not set in environment variables.")
 
     try:
-        # This will automatically trigger OAuth flow if needed
+        customer_id = _resolve_account(customer_id)
+        if manager_id:
+            manager_id = _resolve_account(manager_id)
+        manager_id = _auto_manager_id(customer_id, manager_id)
         result = execute_gaql(customer_id, query, manager_id)
         if ctx:
             ctx.info(f"GAQL query successful. Found {result['totalRows']} rows.")
@@ -102,7 +206,13 @@ def run_gaql(
 
 @mcp.tool
 def list_accounts(ctx: Context = None) -> Dict[str, Any]:
-    """List all accessible accounts including nested sub-accounts."""
+    """List all accessible Google Ads accounts including sub-accounts under MCC managers.
+
+    Returns accounts with access_type ('direct' or 'managed') and is_manager flag.
+    Use this to determine which accounts need manager_id in run_gaql/run_keyword_planner:
+    - access_type='direct': query directly, no manager_id needed
+    - access_type='managed': must pass parent_id as manager_id in other tool calls
+    """
     if ctx:
         ctx.info("Checking credentials and preparing to list accounts...")
 
@@ -185,150 +295,113 @@ def run_keyword_planner(
     start_month: Optional[str] = None,
     end_year: Optional[int] = None,
     end_month: Optional[str] = None,
+    language_id: Optional[int] = None,
+    geo_target_constants: Optional[List[int]] = None,
     ctx: Context = None
 ) -> Dict[str, Any]:
-    """Generate keyword ideas using Google Ads KeywordPlanIdeaService.
-
-    This tool allows you to generate keyword ideas based on seed keywords or a page URL. 
-    You can specify targeting parameters such as language, location, and network to refine your keyword suggestions.
+    """Generate keyword ideas from seed keywords or a page URL using Google Ads KeywordPlanIdeaService.
 
     Args:
-        customer_id: The Google Ads customer ID (10 digits, no dashes)
-        keywords: A list of seed keywords to generate ideas from
-        manager_id: Manager ID if access type is 'managed'
-        page_url: Optional page URL related to your business to generate ideas from
-        start_year: Optional start year for historical data (defaults to previous year)
-        start_month: Optional start month for historical data (defaults to JANUARY)
-        end_year: Optional end year for historical data (defaults to current year)
-        end_month: Optional end month for historical data (defaults to current month)
-
-    Returns:
-        A list of keyword ideas with associated metrics
-
-    Note:
-        - At least one of 'keywords' or 'page_url' must be provided
-        - Ensure that the 'customer_id' is formatted as a string, even if it appears numeric
-        - Valid months: JANUARY, FEBRUARY, MARCH, APRIL, MAY, JUNE, JULY, AUGUST, SEPTEMBER, OCTOBER, NOVEMBER, DECEMBER
+        customer_id: Customer ID (10 digits) or account name. Names are resolved via cached account list.
+        keywords: Seed keywords to generate ideas from. At least one of keywords or page_url required.
+        manager_id: MCC manager ID or name. Auto-filled for managed sub-accounts if omitted. Only needed to override the auto-detected manager.
+        page_url: URL related to your business to seed keyword ideas from
+        start_year: Start year for historical data (default: previous year)
+        start_month: Start month for historical data (default: JANUARY). Values: JANUARY-DECEMBER
+        end_year: End year for historical data (default: current year)
+        end_month: End month for historical data (default: current month). Values: JANUARY-DECEMBER
+        language_id: Language constant ID for filtering keyword data (default: 1000=English). Common: 1000=English, 1001=German, 1002=French, 1004=Italian
+        geo_target_constants: List of geo target constant IDs for country/region filtering (default: [2840]=USA). Common: 2756=Switzerland, 2250=France, 2276=Germany, 2826=UK. Pass multiple for combined targeting e.g. [2756, 2250]
     """
     if ctx:
         ctx.info(f"Generating keyword ideas for customer {customer_id}...")
-        if keywords:
-            ctx.info(f"Seed keywords: {', '.join(keywords)}")
-        if page_url:
-            ctx.info(f"Page URL: {page_url}")
 
     if not GOOGLE_ADS_DEVELOPER_TOKEN:
         raise ValueError("Google Ads Developer Token is not set in environment variables.")
-    
-    # Validate that at least one of keywords or page_url is provided
-    if (not keywords or len(keywords) == 0) and not page_url:
-        raise ValueError("At least one of keywords or page URL is required, but neither was specified.")
-    
+
+    if not keywords and not page_url:
+        raise ValueError("At least one of keywords or page_url is required.")
+
     try:
-        # This will automatically trigger OAuth flow if needed
+        customer_id = _resolve_account(customer_id)
+        if manager_id:
+            manager_id = _resolve_account(manager_id)
+        manager_id = _auto_manager_id(customer_id, manager_id)
+
         headers = get_headers_with_auto_token()
-        
-        formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}:generateKeywordIdeas"
-        
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{customer_id}:generateKeywordIdeas"
+
         if manager_id:
             headers['login-customer-id'] = format_customer_id(manager_id)
-        
-        # Set up dynamic date range with user-provided values or smart defaults
-        from datetime import datetime
-        current_date = datetime.now()
-        current_year = current_date.year
-        current_month = current_date.strftime('%B').upper()
-        
+
+        # Date range defaults
+        now = datetime.now()
         valid_months = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE',
                         'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER']
-        
-        # Use provided dates or fall back to defaults
-        start_year_final = start_year or (current_year - 1)
+
+        start_year_final = start_year or (now.year - 1)
         start_month_final = start_month.upper() if start_month and start_month.upper() in valid_months else 'JANUARY'
-        end_year_final = end_year or current_year
-        end_month_final = end_month.upper() if end_month and end_month.upper() in valid_months else current_month
-        
-        # Build the request body according to Google Ads API specification
+        end_year_final = end_year or now.year
+        end_month_final = end_month.upper() if end_month and end_month.upper() in valid_months else now.strftime('%B').upper()
+
         request_body = {
-            'language': 'languageConstants/1000',
-            'geoTargetConstants': ['geoTargetConstants/2840'],
+            'language': f'languageConstants/{language_id}' if language_id else 'languageConstants/1000',
+            'geoTargetConstants': [f'geoTargetConstants/{geo_id}' for geo_id in geo_target_constants] if geo_target_constants else ['geoTargetConstants/2840'],
             'keywordPlanNetwork': 'GOOGLE_SEARCH_AND_PARTNERS',
             'includeAdultKeywords': False,
             'pageSize': 25,
             'historicalMetricsOptions': {
                 'yearMonthRange': {
-                    'start': {
-                        'year': start_year_final,
-                        'month': start_month_final
-                    },
-                    'end': {
-                        'year': end_year_final,
-                        'month': end_month_final
-                    }
+                    'start': {'year': start_year_final, 'month': start_month_final},
+                    'end': {'year': end_year_final, 'month': end_month_final}
                 }
             }
         }
-        
+
         # Set the appropriate seed based on what's provided
-        if (not keywords or len(keywords) == 0) and page_url:
+        if not keywords and page_url:
             request_body['urlSeed'] = {'url': page_url}
-        elif keywords and len(keywords) > 0 and not page_url:
+        elif keywords and not page_url:
             request_body['keywordSeed'] = {'keywords': keywords}
-        elif keywords and len(keywords) > 0 and page_url:
-            request_body['keywordAndUrlSeed'] = {
-                'url': page_url,
-                'keywords': keywords
-            }
-        
+        elif keywords and page_url:
+            request_body['keywordAndUrlSeed'] = {'url': page_url, 'keywords': keywords}
+
         response = requests.post(url, headers=headers, json=request_body)
-        
+
         if not response.ok:
             error_text = response.text
             if ctx:
                 ctx.error(f"Keyword planner request failed: {response.status_code} {response.reason}")
             raise Exception(f"Error executing request: {response.status_code} {response.reason} - {error_text}")
-        
+
         results = response.json()
-        
+
         if 'results' not in results or not results['results']:
-            message = f"No keyword ideas found for the provided inputs.\n\nKeywords: {', '.join(keywords) if keywords else 'None'}\nPage URL: {page_url or 'None'}\nAccount: {formatted_customer_id}"
-            if ctx:
-                ctx.info(message)
-            return {
-                "message": message,
-                "keywords": keywords or [],
-                "page_url": page_url,
-                "date_range": f"{start_month_final} {start_year_final} to {end_month_final} {end_year_final}"
-            }
-        
-        # Format the results for better readability
+            return {"message": "No keyword ideas found.", "count": 0}
+
+        # Format results with token-efficient keys and pre-converted bid values
         formatted_results = []
         for result in results['results']:
-            keyword_idea = result.get('keywordIdeaMetrics', {})
-            keyword_text = result.get('text', 'N/A')
-            
-            formatted_result = {
-                'keyword': keyword_text,
-                'avg_monthly_searches': keyword_idea.get('avgMonthlySearches', 'N/A'),
-                'competition': keyword_idea.get('competition', 'N/A'),
-                'competition_index': keyword_idea.get('competitionIndex', 'N/A'),
-                'low_top_of_page_bid_micros': keyword_idea.get('lowTopOfPageBidMicros', 'N/A'),
-                'high_top_of_page_bid_micros': keyword_idea.get('highTopOfPageBidMicros', 'N/A')
-            }
-            formatted_results.append(formatted_result)
-        
+            m = result.get('keywordIdeaMetrics', {})
+            low_bid = m.get('lowTopOfPageBidMicros')
+            high_bid = m.get('highTopOfPageBidMicros')
+            formatted_results.append({
+                'keyword': result.get('text', 'N/A'),
+                'volume': m.get('avgMonthlySearches', 'N/A'),
+                'competition': m.get('competition', 'N/A'),
+                'comp_index': m.get('competitionIndex', 'N/A'),
+                'low_bid': round(int(low_bid) / 1_000_000, 2) if low_bid else 'N/A',
+                'high_bid': round(int(high_bid) / 1_000_000, 2) if high_bid else 'N/A',
+            })
+
         if ctx:
             ctx.info(f"Found {len(formatted_results)} keyword ideas.")
-        
+
         return {
-            "keyword_ideas": formatted_results,
-            "total_ideas": len(formatted_results),
-            "input_keywords": keywords or [],
-            "input_page_url": page_url,
-            "date_range": f"{start_month_final} {start_year_final} to {end_month_final} {end_year_final}"
+            "count": len(formatted_results),
+            "keywords": formatted_results
         }
-        
+
     except Exception as e:
         if ctx:
             ctx.error(f"An unexpected error occurred: {e}")
@@ -337,120 +410,55 @@ def run_keyword_planner(
 @mcp.resource("gaql://reference")
 def gaql_reference() -> str:
     """Google Ads Query Language (GAQL) reference documentation."""
-    return """Schema Format:    
-                ## Basic Query Structure
-                '''
-                SELECT field1, field2, ... 
-                FROM resource_type
-                WHERE condition
-                ORDER BY field [ASC|DESC]
-                LIMIT n
-                '''
+    return """\
+## Basic Query Structure
+SELECT field1, field2, ...
+FROM resource_type
+WHERE condition
+ORDER BY field [ASC|DESC]
+LIMIT n
 
-                ## Common Field Types
+## Common Fields
 
-                ### Resource Fields
-                - campaign.id, campaign.name, campaign.status
-                - ad_group.id, ad_group.name, ad_group.status
-                - ad_group_ad.ad.id, ad_group_ad.ad.final_urls
-                - ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type (for keyword_view)
+Resource: campaign.id, campaign.name, campaign.status
+Ad Group: ad_group.id, ad_group.name, ad_group.status
+Ads: ad_group_ad.ad.id, ad_group_ad.ad.final_urls
+Keywords: ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type (use with keyword_view)
 
-                ### Metric Fields
-                - metrics.impressions
-                - metrics.clicks
-                - metrics.cost_micros
-                - metrics.conversions
-                - metrics.conversions_value (direct conversion revenue - primary revenue metric)
-                - metrics.ctr
-                - metrics.average_cpc
+Metrics: metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions,
+  metrics.conversions_value (direct revenue), metrics.all_conversions_value (includes view-through),
+  metrics.ctr, metrics.average_cpc
 
-                ### Segment Fields
-                - segments.date
-                - segments.device
-                - segments.day_of_week
+Segments: segments.date, segments.device, segments.day_of_week
 
-                ## Common WHERE Clauses
+## WHERE Clauses
 
-                ### Date Ranges
-                - WHERE segments.date DURING LAST_7_DAYS
-                - WHERE segments.date DURING LAST_30_DAYS
-                - WHERE segments.date BETWEEN '2023-01-01' AND '2023-01-31'
+Date: segments.date DURING LAST_7_DAYS | LAST_30_DAYS | BETWEEN '2023-01-01' AND '2023-01-31'
+Filter: campaign.status = 'ENABLED' | metrics.clicks > 100 | campaign.name LIKE '%Brand%'
+Note: Use LIKE not CONTAINS (CONTAINS is not supported). Date ranges must be finite.
 
-                ### Filtering
-                - WHERE campaign.status = 'ENABLED'
-                - WHERE metrics.clicks > 100
-                - WHERE campaign.name LIKE '%Brand%'
-                - Use LIKE '%keyword%' instead of CONTAINS 'keyword' (CONTAINS not supported)
+## Examples
 
-                EXAMPLE QUERIES:
+1. Campaign metrics:
+SELECT campaign.id, campaign.name, metrics.clicks, metrics.impressions, metrics.cost_micros
+FROM campaign WHERE segments.date DURING LAST_7_DAYS
 
-                1. Basic campaign metrics:
-                SELECT 
-                campaign.id,
-                campaign.name, 
-                metrics.clicks, 
-                metrics.impressions,
-                metrics.cost_micros
-                FROM campaign 
-                WHERE segments.date DURING LAST_7_DAYS
+2. Ad group performance:
+SELECT campaign.id, ad_group.name, metrics.conversions, metrics.cost_micros, campaign.name
+FROM ad_group WHERE metrics.clicks > 100
 
-                2. Ad group performance:
-                SELECT 
-                campaign.id,
-                ad_group.name, 
-                metrics.conversions, 
-                metrics.cost_micros,
-                campaign.name
-                FROM ad_group 
-                WHERE metrics.clicks > 100
+3. Keyword analysis:
+SELECT campaign.id, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.ctr
+FROM keyword_view WHERE segments.date DURING LAST_30_DAYS ORDER BY metrics.impressions DESC
 
-                3. Keyword analysis (CORRECT field names):
-                SELECT 
-                campaign.id,
-                ad_group_criterion.keyword.text, 
-                ad_group_criterion.keyword.match_type,
-                metrics.average_position, 
-                metrics.ctr
-                FROM keyword_view 
-                WHERE segments.date DURING LAST_30_DAYS
-                ORDER BY metrics.impressions DESC
+4. Conversion data with revenue:
+SELECT campaign.id, campaign.name, metrics.conversions, metrics.conversions_value, metrics.cost_micros
+FROM campaign WHERE segments.date DURING LAST_30_DAYS
 
-                4. Get conversion data with revenue:
-                SELECT
-                campaign.id,
-                campaign.name,
-                metrics.conversions,
-                metrics.conversions_value,
-                metrics.all_conversions_value,
-                metrics.cost_micros
-                FROM campaign
-                WHERE segments.date DURING LAST_30_DAYS
-
-                IMPORTANT NOTES & COMMON ERRORS TO AVOID:
-
-                ### Field Errors to Avoid:
-                WRONG: campaign.campaign_budget.amount_micros
-                CORRECT: campaign_budget.amount_micros (query from campaign_budget resource)
-
-                WRONG: keyword.text, keyword.match_type  
-                CORRECT: ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type
-
-                ### Required Fields:
-                - Always include campaign.id when querying ad_group, keyword_view, or other campaign-related resources
-                - Some resources require specific reference fields in SELECT clause
-
-                ### Revenue Metrics:
-                - metrics.conversions_value = Direct conversion revenue (use for ROI calculations)
-                - metrics.all_conversions_value = Total attributed revenue (includes view-through)
-
-                ### String Matching:
-                - Use LIKE '%keyword%' not CONTAINS 'keyword'
-                - GAQL does not support CONTAINS operator
-
-                NOTE:
-                - Date ranges must be finite: LAST_7_DAYS, LAST_30_DAYS, or BETWEEN dates
-                - Cannot use open-ended ranges like >= '2023-01-31'
-                - Always include campaign.id when error messages request it."""
+## Common Errors
+- WRONG: campaign.campaign_budget.amount_micros -> CORRECT: campaign_budget.amount_micros (separate resource)
+- WRONG: keyword.text -> CORRECT: ad_group_criterion.keyword.text
+- Always include campaign.id when querying ad_group, keyword_view, or related resources"""
 
 if __name__ == "__main__":
     import sys
